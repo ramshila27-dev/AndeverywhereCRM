@@ -1,0 +1,42 @@
+{
+  "name": "voyage-crm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI itinerary builder with built-in CRM for travel agencies",
+  "scripts": {
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "lint": "next lint",
+    "db:push": "prisma db push",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio",
+    "db:import": "node scripts/import-rates.mjs",
+    "db:seed": "node scripts/seed-admin.mjs",
+    "db:seed:demo": "node scripts/seed-demo-users.mjs",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@prisma/client": "6.19.3",
+    "@react-pdf/renderer": "^4.5.1",
+    "bcryptjs": "^3.0.3",
+    "docx": "^9.7.1",
+    "exceljs": "^4.4.0",
+    "jose": "^6.2.3",
+    "next": "14.2.15",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "prisma": "6.19.3",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.6.2"
+  }
+}

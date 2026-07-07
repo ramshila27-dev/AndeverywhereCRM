@@ -1,0 +1,369 @@
+diff --git a/src/app/api/quotes/[id]/pdf/route.ts b/src/app/api/quotes/[id]/pdf/route.ts
+index fb4a133..8cc64eb 100644
+--- a/src/app/api/quotes/[id]/pdf/route.ts
++++ b/src/app/api/quotes/[id]/pdf/route.ts
+@@ -1,6 +1,7 @@
+ import { prisma } from "@/lib/prisma";
+ import { renderQuotePdf } from "@/lib/pdf/QuoteDoc";
+-import type { QuoteItem } from "@/lib/types";
++import { convertFromBase } from "@/lib/currency";
++import type { QuoteDayPlan, QuoteItem } from "@/lib/types";
+ 
+ export const runtime = "nodejs";
+ 
+@@ -12,9 +13,11 @@ function fmt(d: Date): string {
+   });
+ }
+ 
+-// GET /api/quotes/:id/pdf — branded client-facing PDF quotation.
++// GET /api/quotes/:id/pdf?currency=USD — branded client-facing PDF quotation.
++// If `currency` is omitted or has no exchange rate on file, falls back to
++// the quote's net currency (HKD) rather than showing a wrong number.
+ export async function GET(
+-  _req: Request,
++  req: Request,
+   { params }: { params: { id: string } },
+ ) {
+   const quote = await prisma.quote.findUnique({
+@@ -28,6 +31,9 @@ export async function GET(
+     });
+   }
+ 
++  const requestedCurrency = new URL(req.url).searchParams.get("currency") || undefined;
++  const converted = await convertFromBase(Number(quote.total), requestedCurrency);
++
+   const guest = quote.query
+     ? `${quote.query.salutation ? quote.query.salutation + " " : ""}${quote.query.guestName}`
+     : undefined;
+@@ -43,12 +49,13 @@ export async function GET(
+       quote.children ? ` · ${quote.children} Child${quote.children > 1 ? "ren" : ""}` : ""
+     }`,
+     status: quote.status,
+-    currency: quote.currency,
+-    total: Number(quote.total),
++    currency: converted.currency,
++    total: converted.amount,
+     guestName: guest,
+     salesTeam: quote.query?.salesTeam,
+     dateStr: fmt(quote.createdAt),
+     items: (quote.items as unknown as QuoteItem[]) ?? [],
++    days: (quote.days as unknown as QuoteDayPlan[]) ?? undefined,
+   });
+ 
+   return new Response(new Uint8Array(pdf), {
+diff --git a/src/app/api/quotes/[id]/word/route.ts b/src/app/api/quotes/[id]/word/route.ts
+new file mode 100644
+index 0000000..9bdc750
+--- /dev/null
++++ b/src/app/api/quotes/[id]/word/route.ts
+@@ -0,0 +1,59 @@
++import { prisma } from "@/lib/prisma";
++import { renderQuoteWord } from "@/lib/word/QuoteWord";
++import { convertFromBase } from "@/lib/currency";
++import type { QuoteDayPlan, QuoteItem } from "@/lib/types";
++
++export const runtime = "nodejs";
++
++function fmt(d: Date): string {
++  return new Date(d).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
++}
++
++// GET /api/quotes/:id/word?currency=USD — same content as the PDF quotation,
++// as a downloadable .docx.
++export async function GET(req: Request, { params }: { params: { id: string } }) {
++  const quote = await prisma.quote.findUnique({
++    where: { id: params.id },
++    include: { query: { select: { guestName: true, salutation: true, salesTeam: true } } },
++  });
++  if (!quote) {
++    return new Response(JSON.stringify({ error: "Not found." }), {
++      status: 404,
++      headers: { "Content-Type": "application/json" },
++    });
++  }
++
++  const requestedCurrency = new URL(req.url).searchParams.get("currency") || undefined;
++  const converted = await convertFromBase(Number(quote.total), requestedCurrency);
++
++  const guest = quote.query
++    ? `${quote.query.salutation ? quote.query.salutation + " " : ""}${quote.query.guestName}`
++    : undefined;
++  const reference = `QT-${quote.id.slice(-6).toUpperCase()}`;
++
++  const buffer = await renderQuoteWord({
++    reference,
++    title: quote.title,
++    city: quote.city,
++    dateRange: `${fmt(quote.checkIn)} – ${fmt(quote.checkOut)}`,
++    pax: `${quote.adults} Adult${quote.adults > 1 ? "s" : ""}${
++      quote.children ? ` · ${quote.children} Child${quote.children > 1 ? "ren" : ""}` : ""
++    }`,
++    status: quote.status,
++    currency: converted.currency,
++    total: converted.amount,
++    guestName: guest,
++    salesTeam: quote.query?.salesTeam,
++    dateStr: fmt(quote.createdAt),
++    items: (quote.items as unknown as QuoteItem[]) ?? [],
++    days: (quote.days as unknown as QuoteDayPlan[]) ?? undefined,
++  });
++
++  return new Response(new Uint8Array(buffer), {
++    headers: {
++      "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++      "Content-Disposition": `attachment; filename="${reference}.docx"`,
++      "Cache-Control": "no-store",
++    },
++  });
++}
+diff --git a/src/lib/pdf/QuoteDoc.tsx b/src/lib/pdf/QuoteDoc.tsx
+index e57c257..80eb931 100644
+--- a/src/lib/pdf/QuoteDoc.tsx
++++ b/src/lib/pdf/QuoteDoc.tsx
+@@ -12,7 +12,7 @@ import {
+ } from "@react-pdf/renderer";
+ import { COMPANY } from "@/lib/company";
+ import { formatMoney } from "@/lib/pricing";
+-import type { QuoteItem, QuoteItemKind } from "@/lib/types";
++import type { QuoteDayPlan, QuoteItem, QuoteItemKind } from "@/lib/types";
+ 
+ const NAVY = "#1b2857";
+ const NAVY2 = "#2b3f89";
+@@ -76,8 +76,11 @@ const KIND_LABEL: Record<QuoteItemKind, string> = {
+   hotel: "Accommodation",
+   transfer: "Transfers",
+   activity: "Activities & Tickets",
++  guide: "Guide",
++  other: "Other Services",
++  charge: "Additional Charges",
+ };
+-const KIND_ORDER: QuoteItemKind[] = ["hotel", "transfer", "activity"];
++const KIND_ORDER: QuoteItemKind[] = ["hotel", "transfer", "activity", "guide", "other", "charge"];
+ 
+ export interface PdfQuoteInput {
+   reference: string;
+@@ -92,6 +95,7 @@ export interface PdfQuoteInput {
+   salesTeam?: string;
+   dateStr: string;
+   items: QuoteItem[];
++  days?: QuoteDayPlan[];
+ }
+ 
+ interface ResolvedItem extends QuoteItem {
+@@ -121,6 +125,12 @@ const s = StyleSheet.create({
+   sectionBar: { width: 3, height: 11, backgroundColor: RED, marginRight: 5 },
+   sectionTitleRow: { flexDirection: "row", alignItems: "center", marginTop: 16, marginBottom: 6 },
+ 
++  dayBox: { borderWidth: 1, borderColor: LINE, borderRadius: 5, padding: 8, marginBottom: 6 },
++  dayTitle: { fontSize: 9.5, fontFamily: "Helvetica-Bold", color: NAVY, marginBottom: 3 },
++  dayItemRow: { flexDirection: "row", marginBottom: 1.5 },
++  dayItemKind: { fontSize: 7, color: "#ffffff", backgroundColor: NAVY2, borderRadius: 3, paddingHorizontal: 4, paddingVertical: 1, marginRight: 5, textTransform: "uppercase" },
++  dayItemLabel: { fontSize: 8.5, color: INK, flex: 1 },
++
+   item: { flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: LINE, borderRadius: 5, padding: 7, marginBottom: 6 },
+   itemImg: { width: 74, height: 52, borderRadius: 4, objectFit: "cover", marginRight: 10 },
+   itemBody: { flex: 1 },
+@@ -215,6 +225,33 @@ function QuoteDocument({
+           <Meta label="Status" value={q.status} />
+         </View>
+ 
++        {/* Day-wise itinerary */}
++        {q.days && q.days.length > 0 && (
++          <View wrap={false}>
++            <View style={s.sectionTitleRow}>
++              <View style={s.sectionBar} />
++              <Text style={{ fontSize: 11, fontFamily: "Helvetica-Bold", color: NAVY }}>
++                Day-wise Itinerary
++              </Text>
++            </View>
++            {q.days.map((day) => (
++              <View key={day.date} style={s.dayBox} wrap={false}>
++                <Text style={s.dayTitle}>Day {day.dayNumber} — {day.date}</Text>
++                {day.items.length === 0 ? (
++                  <Text style={{ fontSize: 8, color: MUTE }}>No services scheduled this day.</Text>
++                ) : (
++                  day.items.map((it, i) => (
++                    <View key={i} style={s.dayItemRow}>
++                      <Text style={s.dayItemKind}>{KIND_LABEL[it.kind]}</Text>
++                      <Text style={s.dayItemLabel}>{clean(it.label)}</Text>
++                    </View>
++                  ))
++                )}
++              </View>
++            ))}
++          </View>
++        )}
++
+         {/* Item sections */}
+         {KIND_ORDER.map((kind) => {
+           const group = items.filter((it) => it.kind === kind);
+@@ -234,7 +271,6 @@ function QuoteDocument({
+                     <Text style={s.itemLabel}>{clean(it.label)}</Text>
+                     {it.detail ? <Text style={s.itemDetail}>{clean(it.detail)}</Text> : null}
+                   </View>
+-                  <Text style={s.itemAmt}>{formatMoney(it.amount, cur)}</Text>
+                 </View>
+               ))}
+             </View>
+diff --git a/src/lib/word/QuoteWord.ts b/src/lib/word/QuoteWord.ts
+new file mode 100644
+index 0000000..8d51fe7
+--- /dev/null
++++ b/src/lib/word/QuoteWord.ts
+@@ -0,0 +1,156 @@
++import {
++  Document,
++  Packer,
++  Paragraph,
++  TextRun,
++  HeadingLevel,
++  Table,
++  TableRow,
++  TableCell,
++  WidthType,
++  AlignmentType,
++  BorderStyle,
++} from "docx";
++import { formatMoney } from "@/lib/pricing";
++import { COMPANY } from "@/lib/company";
++import type { QuoteDayPlan, QuoteItem, QuoteItemKind } from "@/lib/types";
++
++const KIND_LABEL: Record<QuoteItemKind, string> = {
++  hotel: "Accommodation",
++  transfer: "Transfers",
++  activity: "Activities & Tickets",
++  guide: "Guide",
++  other: "Other Services",
++  charge: "Additional Charges",
++};
++const KIND_ORDER: QuoteItemKind[] = ["hotel", "transfer", "activity", "guide", "other", "charge"];
++
++export interface WordQuoteInput {
++  reference: string;
++  title: string;
++  city: string;
++  dateRange: string;
++  pax: string;
++  status: string;
++  currency: string;
++  total: number;
++  guestName?: string;
++  salesTeam?: string;
++  dateStr: string;
++  items: QuoteItem[];
++  days?: QuoteDayPlan[];
++}
++
++function metaCell(label: string, value: string) {
++  return new TableCell({
++    width: { size: 33, type: WidthType.PERCENTAGE },
++    borders: { top: { style: BorderStyle.NONE }, bottom: { style: BorderStyle.NONE }, left: { style: BorderStyle.NONE }, right: { style: BorderStyle.NONE } },
++    children: [
++      new Paragraph({ children: [new TextRun({ text: label.toUpperCase(), size: 14, color: "6b7280" })] }),
++      new Paragraph({ children: [new TextRun({ text: value || "—", bold: true, size: 20 })] }),
++    ],
++  });
++}
++
++export async function renderQuoteWord(q: WordQuoteInput): Promise<Buffer> {
++  const children: (Paragraph | Table)[] = [
++    new Paragraph({ children: [new TextRun({ text: COMPANY.name, bold: true, size: 28, color: "1b2857" })] }),
++    new Paragraph({ children: [new TextRun({ text: `${COMPANY.email} · ${COMPANY.phone} · ${COMPANY.website}`, size: 18, color: "6b7280" })], spacing: { after: 200 } }),
++    new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: "QUOTATION", bold: true, color: "1b2857" })] }),
++    new Paragraph({ children: [new TextRun({ text: `Ref: ${q.reference}   Date: ${q.dateStr}`, size: 18, color: "6b7280" })], spacing: { after: 200 } }),
++    new Table({
++      width: { size: 100, type: WidthType.PERCENTAGE },
++      rows: [
++        new TableRow({ children: [metaCell("Prepared for", q.guestName || q.title), metaCell("Destination", q.city), metaCell("Travel dates", q.dateRange)] }),
++        new TableRow({ children: [metaCell("Guests", q.pax), metaCell("Prepared by", q.salesTeam || "Andeverywhere"), metaCell("Status", q.status)] }),
++      ],
++    }),
++    new Paragraph({ text: "", spacing: { after: 200 } }),
++  ];
++
++  if (q.days && q.days.length > 0) {
++    children.push(
++      new Paragraph({
++        heading: HeadingLevel.HEADING_2,
++        children: [new TextRun({ text: "Day-wise Itinerary", bold: true, color: "1b2857" })],
++        spacing: { before: 100, after: 100 },
++      }),
++    );
++    for (const day of q.days) {
++      children.push(
++        new Paragraph({
++          children: [new TextRun({ text: `Day ${day.dayNumber} — ${day.date}`, bold: true, size: 20 })],
++          spacing: { before: 100 },
++        }),
++      );
++      if (day.items.length === 0) {
++        children.push(
++          new Paragraph({ children: [new TextRun({ text: "No services scheduled this day.", size: 16, color: "6b7280", italics: true })] }),
++        );
++      } else {
++        for (const it of day.items) {
++          children.push(
++            new Paragraph({
++              bullet: { level: 0 },
++              children: [
++                new TextRun({ text: `${KIND_LABEL[it.kind]}: `, bold: true, size: 18 }),
++                new TextRun({ text: it.label, size: 18 }),
++              ],
++            }),
++          );
++        }
++      }
++    }
++    children.push(new Paragraph({ text: "", spacing: { after: 200 } }));
++  }
++
++  for (const kind of KIND_ORDER) {
++    const group = q.items.filter((it) => it.kind === kind);
++    if (!group.length) continue;
++    children.push(
++      new Paragraph({
++        heading: HeadingLevel.HEADING_2,
++        children: [new TextRun({ text: KIND_LABEL[kind], bold: true, color: "1b2857" })],
++        spacing: { before: 200, after: 100 },
++      }),
++    );
++    for (const it of group) {
++      children.push(
++        new Paragraph({ children: [new TextRun({ text: it.label, bold: true })] }),
++      );
++      if (it.detail) {
++        children.push(
++          new Paragraph({ children: [new TextRun({ text: it.detail, size: 18, color: "6b7280" })], spacing: { after: 100 } }),
++        );
++      }
++    }
++  }
++
++  children.push(
++    new Paragraph({ text: "", spacing: { before: 300 } }),
++    new Paragraph({
++      alignment: AlignmentType.RIGHT,
++      children: [
++        new TextRun({ text: `TOTAL (${q.currency}, net):  `, size: 22, color: "6b7280" }),
++        new TextRun({ text: formatMoney(q.total, q.currency), bold: true, size: 28, color: "1b2857" }),
++      ],
++      spacing: { after: 200 },
++    }),
++    new Paragraph({
++      children: [
++        new TextRun({
++          text:
++            "Rates are net and quoted in the currency shown above. Prices are subject to availability at the time of " +
++            "confirmation. A valid confirmation requires an advance as per company policy. This quotation is valid for " +
++            "7 days from the date above.",
++          size: 16,
++          color: "6b7280",
++          italics: true,
++        }),
++      ],
++    }),
++  );
++
++  const doc = new Document({ sections: [{ children }] });
++  return Packer.toBuffer(doc);
++}

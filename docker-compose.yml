@@ -1,0 +1,23 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: voyage-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: voyage
+      POSTGRES_PASSWORD: voyage
+      POSTGRES_DB: voyage
+    ports:
+      # Bind to localhost only so the database is never exposed to the public
+      # internet (important on a VPS). The app connects via localhost.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - voyage-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voyage"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  voyage-db-data:
