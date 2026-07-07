@@ -1,0 +1,485 @@
+// Prisma schema for the Voyage AI itinerary builder + CRM.
+// The data model is intentionally structured so the CRM layer (clients, leads,
+// bookings) can be layered on top of the itinerary builder without a rewrite.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Itinerary {
+  id          String   @id @default(cuid())
+  title       String
+  destination String
+  startDate   DateTime
+  endDate     DateTime
+  travelers   Int      @default(1)
+  budget      String?
+  interests   String[]
+  pace        String   @default("balanced")
+  notes       String?
+  summary     String?
+  status      String   @default("draft") // draft | quoted | booked
+  days        Json // structured day-by-day plan (see src/lib/types.ts)
+  tips        String[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// CONTRACTING RATES CATALOG
+// Modeled from the supplier rate sheets (Hong Kong & Macau hotels, transfers,
+// activities). The unifying pattern across all three domains is SEASONAL
+// PRICING: every product carries a set of named seasons (date bands), and each
+// rate is keyed by (product, season, <secondary axis>) where the secondary
+// axis is room-occupancy for hotels, vehicle-type for transfers, and
+// adult/child for activities.
+//
+// Rates are stored NET (as contracted). A missing/unavailable rate is stored
+// as NULL (the sheets use a sentinel of 1 for "closed / not available").
+// Amounts are assumed to be in HKD unless overridden per product.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// USERS & ACCESS CONTROL
+// The app is used by an agency team: an admin manages employees, assigns them
+// queries, and controls which features each can see. Employees log in to their
+// own portal and only see the queries assigned to them plus the features their
+// admin has granted.
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  SALES_PERSON
+  RESERVATION
+  OPERATION
+}
+
+// PENDING  = created by admin, has not logged in yet
+// ACTIVE   = has logged in at least once
+// SUSPENDED = access revoked, cannot log in
+enum UserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+model User {
+  id                 String     @id @default(cuid())
+  name               String
+  email              String     @unique
+  passwordHash       String
+  roles              Role[]     @default([SALES_PERSON])
+  // Effective feature keys this user may access (see PERMISSIONS in
+  // src/lib/permissions.ts). Seeded from role presets at creation, then
+  // fine-tuned per user by the admin.
+  permissions        String[]   @default([])
+  status             UserStatus @default(PENDING)
+  mustChangePassword Boolean    @default(true)
+  phone              String?
+  invitedAt          DateTime   @default(now())
+  lastActiveAt       DateTime?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  assignedQueries Query[] @relation("AssignedQueries")
+  createdQuotes   Quote[] @relation("CreatedQuotes")
+
+  @@index([status])
+}
+
+// Lifecycle states for a query (see the Trips sidebar). "All" is a filter,
+// not a stored status.
+enum QueryStatus {
+  NEW_QUERY
+  IN_PROGRESS
+  ON_HOLD
+  CONVERTED
+  ON_TRIP
+  PAST_TRIP
+  CANCELED
+  DROPPED
+}
+
+enum HotelExtraKind {
+  EXTRA_BED_ADULT
+  EXTRA_BED_CHILD
+  CHILD_NO_BED
+}
+
+enum PaxType {
+  ADULT
+  CHILD
+}
+
+// ---------------------------- Hotels ---------------------------------------
+
+model Hotel {
+  id         String   @id @default(cuid())
+  name       String
+  // City/destination label (e.g. "Hong Kong", "Macau"). Kept as a free string
+  // rather than an enum so new destinations can be added without a migration.
+  city       String
+  starRating Int? // parsed from "4-STAR" / "5-STAR"
+  imageUrl   String? // photo shown on the client-facing PDF
+  currency   String   @default("HKD")
+  rawTitle   String? // original title cell, e.g. "PARK HOTEL | Hong Kong | 4-STAR"
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  seasons   HotelSeason[]
+  roomTypes RoomType[]
+  extras    HotelExtra[]
+
+  @@unique([name, city])
+}
+
+// A season is a date band scoped to a single hotel (hotels define their own
+// seasons independently — some daily, some multi-week, some day-of-week gated).
+model HotelSeason {
+  id         String   @id @default(cuid())
+  hotelId    String
+  code       String // "Season 1"
+  rawBand    String // original band text, e.g. "01 Jul 2026 - 31 Aug 2026 (Sun,Mon,Tue,Wed,Thu)"
+  startDate  DateTime
+  endDate    DateTime
+  daysOfWeek String? // optional day-of-week restriction captured from the band
+
+  hotel      Hotel            @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  roomRates  RoomRate[]
+  extraRates HotelExtraRate[]
+
+  @@unique([hotelId, code])
+  @@index([startDate, endDate])
+}
+
+model RoomType {
+  id       String @id @default(cuid())
+  hotelId  String
+  category String // "ROOM CATEGORY"
+  name     String // "ROOM TYPE"
+  mealPlan String // e.g. "BB"
+  maxPax   Int // parsed from occupancy code like "2P" -> 2
+
+  hotel Hotel      @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  rates RoomRate[]
+
+  // occupancy is part of a room's identity — the same room name recurs at
+  // different pax counts (e.g. a Deluxe Room sold as 2P and 4P).
+  @@unique([hotelId, name, mealPlan, maxPax])
+}
+
+model RoomRate {
+  id         String   @id @default(cuid())
+  roomTypeId String
+  seasonId   String
+  netRate    Decimal? @db.Decimal(10, 2) // per room per night; NULL = not available
+
+  roomType RoomType    @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+  season   HotelSeason @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  @@unique([roomTypeId, seasonId])
+  @@index([seasonId])
+}
+
+model HotelExtra {
+  id      String         @id @default(cuid())
+  hotelId String
+  kind    HotelExtraKind
+  label   String // original label, e.g. "Extra Bed - Child (3-11)"
+
+  hotel Hotel            @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  rates HotelExtraRate[]
+
+  @@unique([hotelId, kind])
+}
+
+model HotelExtraRate {
+  id       String   @id @default(cuid())
+  extraId  String
+  seasonId String
+  netRate  Decimal? @db.Decimal(10, 2)
+
+  extra  HotelExtra  @relation(fields: [extraId], references: [id], onDelete: Cascade)
+  season HotelSeason @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  @@unique([extraId, seasonId])
+  @@index([seasonId])
+}
+
+// --------------------------- Transfers -------------------------------------
+
+model VehicleType {
+  id     String @id @default(cuid())
+  name   String @unique // "Private Vehicle (6-7 pax)"
+  maxPax Int? // parsed from the name where available
+
+  rates TransferRate[]
+}
+
+// Transfer seasons are catalog-wide (the transport sheet uses a single band).
+model TransferSeason {
+  id        String   @id @default(cuid())
+  code      String   @unique // "Season 1"
+  rawBand   String
+  startDate DateTime
+  endDate   DateTime
+
+  rates TransferRate[]
+}
+
+model Transfer {
+  id           String   @id @default(cuid())
+  fromLocation String // "Hong Kong Airport"
+  toLocation   String // "Kowloon Hotel"
+  service      String // "Private Transfer - One Way" / route note
+  distance     String? // free text from the sheet
+  startTime    String?
+  durationMins Int?
+  daySchedule  String?  @db.Text // multi-line itinerary text when present
+  imageUrl     String? // photo shown on the client-facing PDF
+  currency     String   @default("HKD")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rates TransferRate[]
+
+  @@unique([fromLocation, toLocation, service])
+}
+
+model TransferRate {
+  id            String   @id @default(cuid())
+  transferId    String
+  seasonId      String
+  vehicleTypeId String
+  netRate       Decimal? @db.Decimal(10, 2) // per vehicle per transfer
+
+  transfer    Transfer       @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  season      TransferSeason @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  vehicleType VehicleType    @relation(fields: [vehicleTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([transferId, seasonId, vehicleTypeId])
+  @@index([seasonId])
+}
+
+// --------------------------- Activities ------------------------------------
+
+model ActivitySeason {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  rawBand   String
+  startDate DateTime
+  endDate   DateTime
+
+  rates ActivityRate[]
+}
+
+model Activity {
+  id           String   @id @default(cuid())
+  name         String
+  service      String // category, e.g. "Attractions Ticket", "SIC Transfer + Entry Ticket", "Veg"
+  description  String?  @db.Text
+  openTime     String?
+  closeTime    String?
+  durationMins Int?
+  slots        String?
+  childAgeFrom Int? // from the child column header, e.g. "Child (3-11)"
+  childAgeTo   Int?
+  imageUrl     String? // photo shown on the client-facing PDF
+  currency     String   @default("HKD")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rates ActivityRate[]
+
+  @@unique([name, service])
+}
+
+model ActivityRate {
+  id         String   @id @default(cuid())
+  activityId String
+  seasonId   String
+  paxType    PaxType
+  netRate    Decimal? @db.Decimal(10, 2) // per person
+
+  activity Activity       @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  season   ActivitySeason @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  @@unique([activityId, seasonId, paxType])
+  @@index([seasonId])
+}
+
+// ------------------------------ Guides -------------------------------------
+// Flat per-day rate (no seasonality in the source data, unlike hotels/
+// transfers/activities), scoped to a city.
+
+model Guide {
+  id        String   @id @default(cuid())
+  name      String
+  city      String
+  language  String?
+  imageUrl  String?
+  dailyRate Decimal  @db.Decimal(10, 2)
+  currency  String   @default("HKD")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([name, city])
+}
+
+// -------------------------- Other Services ----------------------------------
+// Catch-all for anything that doesn't fit Hotel/Transfer/Activity/Guide —
+// e.g. visa assistance, travel insurance, SIM cards, porterage.
+
+model OtherService {
+  id          String   @id @default(cuid())
+  name        String
+  city        String
+  description String?  @db.Text
+  unitLabel   String   @default("per service") // "per day" / "per pax" / "per service"
+  rate        Decimal  @db.Decimal(10, 2)
+  imageUrl    String?
+  currency    String   @default("HKD")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([name, city])
+}
+
+// --------------------------- Exchange Rates ---------------------------------
+// Manually maintained by an admin (Rates → Currency) rather than pulled from
+// a paid live-rate API, keeping this a zero-ongoing-cost feature. Rate is
+// "1 unit of base currency (HKD) = rateFromBase units of `currency`".
+
+// --------------------------- Exchange Rates ---------------------------------
+// Manually maintained by an admin (Admin → Currency) rather than a paid live
+// FX API - zero ongoing cost. USD is the fixed pivot currency: every rate
+// means "1 USD = rateFromBase units of `currency`" (standard FX quoting
+// convention). Converting between any two currencies goes via USD as the
+// common denominator - see src/lib/currency.ts.
+
+model ExchangeRate {
+  id           String   @id @default(cuid())
+  currency     String   @unique // "USD", "EUR", "HKD", "INR", ...
+  symbol       String // "$", "€", "HK$", "₹"
+  name         String // "US Dollar"
+  rateFromBase Decimal  @db.Decimal(14, 6) // 1 USD = rateFromBase units of `currency`
+  isBase       Boolean  @default(false) // true only for USD; fixed at rate 1
+  updatedAt    DateTime @updatedAt
+}
+
+// ------------------------------ Query --------------------------------------
+// A travel enquiry (the CRM entry point). Mirrors the "New Query" form:
+// source, destination & duration, guest details, and free-text notes. A query
+// moves through the lifecycle in QueryStatus and can spawn one or more quotes.
+
+// ----------------------------- Agents ---------------------------------------
+// A B2B agent/agency that sends queries. Saved once, then looked up by name/
+// mobile/email from the Add Query form so repeat agents auto-fill instead of
+// being re-typed. `mobile` is the dedupe key: saving a query with a mobile
+// number that already exists updates that same agent record rather than
+// creating a duplicate.
+
+model Agent {
+  id          String   @id @default(cuid())
+  companyName String
+  agentName   String
+  mobile      String   @unique
+  email       String?
+  address     String?
+  city        String?
+  pincode     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  queries Query[]
+
+  @@index([companyName])
+  @@index([agentName])
+}
+
+model Query {
+  id           String      @id @default(cuid())
+  // Query Source
+  source       String? // e.g. "B2B", "Website", "Referral"
+  referenceId  String? // agency's own reference id
+  salesTeam    String? // sales person's name - entered manually each time, never defaulted
+  // (assigneeId removed - see `assignees` many-to-many relation below)
+  agentId      String? // B2B agent this query came from (see Agent model)
+  tags         String[]
+  // Destination & Duration
+  destinations String[]
+  startDate    DateTime?
+  nights       Int         @default(1)
+  adults       Int         @default(1)
+  childAges    Int[] // one entry per child (length = number of children)
+  infants      Int         @default(0) // infants (typically under 2), no individual ages tracked
+  totalFoc     Int         @default(0) // free-of-cost pax
+  // Guest Details
+  salutation   String?
+  guestName    String
+  phones       Json // [{ code: "91-IN", number: "9779212233" }]
+  email        String?
+  location     String?
+  // Notes
+  comments     String?
+  // Lifecycle
+  status       QueryStatus @default(NEW_QUERY)
+  currency     String      @default("HKD")
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  quotes    Quote[]
+  assignees User[] @relation("AssignedQueries")
+  agent     Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([agentId])
+}
+
+// ----------------------------- Quotes --------------------------------------
+// A quote is a point-in-time, itemized price built from the contracting-rates
+// catalog. Line items are snapshotted as JSON (rates may change later; a quote
+// must preserve the numbers it was built with), mirroring how Itinerary.days
+// is stored. See src/lib/types.ts for the QuoteItem shape.
+
+model Quote {
+  id        String   @id @default(cuid())
+  title     String
+  city      String // destination label
+  checkIn   DateTime
+  checkOut  DateTime
+  adults    Int      @default(2)
+  children  Int      @default(0)
+  currency  String   @default("HKD")
+  status    String   @default("draft") // draft | sent | confirmed
+  items     Json // QuoteItem[] snapshot
+  days      Json? // auto-derived day-wise itinerary snapshot (see src/lib/itinerary.ts)
+  subtotal  Decimal  @db.Decimal(12, 2) @default(0)
+  markupType  String  @default("PERCENT") // "PERCENT" | "FIXED"
+  markupValue Decimal @db.Decimal(12, 2) @default(0)
+  total     Decimal  @db.Decimal(12, 2) @default(0)
+  inclusions  String[] @default([])
+  exclusions  String[] @default([])
+  notes       String?
+  queryId     String? // optional link back to the originating query
+  createdById String? // employee who built the quote
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  query     Query? @relation(fields: [queryId], references: [id], onDelete: SetNull)
+  createdBy User?  @relation("CreatedQuotes", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([queryId])
+  @@index([createdById])
+}
